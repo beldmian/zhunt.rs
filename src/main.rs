@@ -47,6 +47,35 @@ const RT: f64 = 0.59004; // 0.00198*298
 const A: f64 = 0.357; // 2 * (1/10.5 + 1/12)
 const B: f64 = 0.4;
 
+/// Format probability with leading zero in exponent (e.g., 3.026373e-02 instead of 3.026373e-2)
+/// Special case: zero exponent should be formatted as e0 (not e+00)
+fn format_probability(prob: f64) -> String {
+    let formatted = format!("{:.6e}", prob);
+    
+    // Check if we have a single-digit exponent and add leading zero
+    if let Some(e_pos) = formatted.find('e') {
+        let (mantissa, exponent_part) = formatted.split_at(e_pos);
+        let exponent_str = &exponent_part[1..]; // Skip the 'e'
+        
+        if exponent_str.len() == 2 && (exponent_str.starts_with('+') || exponent_str.starts_with('-')) {
+            let sign = &exponent_str[0..1];
+            let digit = &exponent_str[1..2];
+            
+            // Special case: zero exponent should be formatted as e0
+            if digit == "0" {
+                format!("{}e0", mantissa)
+            } else {
+                // Single digit exponent, add leading zero
+                format!("{}e{}0{}", mantissa, sign, digit)
+            }
+        } else {
+            formatted
+        }
+    } else {
+        formatted
+    }
+}
+
 // Delta BZ Energy of Dinucleotide
 const DBZED: [[f64; 17]; 4] = [
     // AS-AS
@@ -72,11 +101,6 @@ struct ZHunt {
     best_esum: f64,
     deltatwist: f64,
     terms: usize,
-    // Reusable buffers to avoid allocations
-    dp_energy_buffer: Vec<[f64; 2]>,
-    dp_bzenergy_buffer: Vec<f64>,
-    dp_antisyn_buffer: Vec<char>,
-    temp_antisyn: Vec<char>,
 }
 
 #[derive(Clone)]
@@ -123,11 +147,6 @@ impl ZHunt {
             best_esum: 0.0,
             deltatwist: 0.0,
             terms: 0,
-            // Initialize reusable buffers
-            dp_energy_buffer: vec![[f64::INFINITY; 2]; dinucleotides + 1],
-            dp_bzenergy_buffer: Vec::with_capacity(dinucleotides * 2),
-            dp_antisyn_buffer: Vec::with_capacity(nucleotides + 1),
-            temp_antisyn: Vec::with_capacity(nucleotides + 1),
         }
     }
     
@@ -314,22 +333,17 @@ impl ZHunt {
     
     
     fn anti_syn_energy(&mut self, _din: usize, dinucleotides: usize, _esum: f64) {
-        // Use optimized dynamic programming with reusable buffers
-        // This eliminates heavy vector allocations and cloning
+        // Use dynamic programming instead of exponential recursion
+        // This reduces complexity from O(2^n) to O(n)
         
-        // Resize and clear reusable buffers
-        self.dp_energy_buffer.clear();
-        self.dp_energy_buffer.resize(dinucleotides + 1, [f64::INFINITY; 2]);
-        self.dp_bzenergy_buffer.clear();
-        self.dp_antisyn_buffer.clear();
+        // For each position and configuration (AS=0, SA=1), store the minimum energy
+        let mut dp_energy = vec![vec![f64::INFINITY; 2]; dinucleotides + 1];
+        let mut dp_bzenergy = vec![vec![Vec::<f64>::new(), Vec::<f64>::new()]; dinucleotides + 1];
+        let mut dp_antisyn = vec![vec![Vec::<char>::new(), Vec::<char>::new()]; dinucleotides + 1];
         
         // Base case: empty sequence
-        self.dp_energy_buffer[0][0] = 0.0;
-        self.dp_energy_buffer[0][1] = 0.0;
-        
-        // Track best path using indices instead of storing full paths
-        let mut best_prev = vec![[0usize; 2]; dinucleotides + 1];
-        let mut best_config_path = vec![0usize; dinucleotides + 1];
+        dp_energy[0][0] = 0.0;
+        dp_energy[0][1] = 0.0;
         
         // Fill DP table
         for din in 0..dinucleotides {
@@ -337,7 +351,7 @@ impl ZHunt {
             
             // Try both previous configurations
             for prev_config in 0..2 {
-                if self.dp_energy_buffer[din][prev_config] == f64::INFINITY {
+                if dp_energy[din][prev_config] == f64::INFINITY {
                     continue;
                 }
                 
@@ -351,12 +365,17 @@ impl ZHunt {
                 };
                 
                 let e_as = DBZED[i][bzindex_din];
-                let new_energy_as = self.dp_energy_buffer[din][prev_config] + e_as;
+                let new_energy_as = dp_energy[din][prev_config] + e_as;
                 
-                if new_energy_as < self.dp_energy_buffer[din + 1][0] {
-                    self.dp_energy_buffer[din + 1][0] = new_energy_as;
-                    best_prev[din + 1][0] = prev_config;
-                    best_config_path[din + 1] = 0;
+                if new_energy_as < dp_energy[din + 1][0] {
+                    dp_energy[din + 1][0] = new_energy_as;
+                    
+                    dp_bzenergy[din + 1][0] = dp_bzenergy[din][prev_config].clone();
+                    dp_bzenergy[din + 1][0].push(self.exp_dbzed[i][bzindex_din]);
+                    
+                    dp_antisyn[din + 1][0] = dp_antisyn[din][prev_config].clone();
+                    dp_antisyn[din + 1][0].push('A');
+                    dp_antisyn[din + 1][0].push('S');
                 }
                 
                 // Try SA configuration for current position
@@ -369,75 +388,39 @@ impl ZHunt {
                 };
                 
                 let e_sa = DBZED[i][bzindex_din];
-                let new_energy_sa = self.dp_energy_buffer[din][prev_config] + e_sa;
+                let new_energy_sa = dp_energy[din][prev_config] + e_sa;
                 
-                if new_energy_sa < self.dp_energy_buffer[din + 1][1] {
-                    self.dp_energy_buffer[din + 1][1] = new_energy_sa;
-                    best_prev[din + 1][1] = prev_config;
-                    best_config_path[din + 1] = 1;
+                if new_energy_sa < dp_energy[din + 1][1] {
+                    dp_energy[din + 1][1] = new_energy_sa;
+                    
+                    dp_bzenergy[din + 1][1] = dp_bzenergy[din][prev_config].clone();
+                    dp_bzenergy[din + 1][1].push(self.exp_dbzed[i][bzindex_din]);
+                    
+                    dp_antisyn[din + 1][1] = dp_antisyn[din][prev_config].clone();
+                    dp_antisyn[din + 1][1].push('S');
+                    dp_antisyn[din + 1][1].push('A');
                 }
             }
         }
         
         // Find the best configuration
-        let best_config = if self.dp_energy_buffer[dinucleotides][0] < self.dp_energy_buffer[dinucleotides][1] { 0 } else { 1 };
+        let best_config = if dp_energy[dinucleotides][0] < dp_energy[dinucleotides][1] { 0 } else { 1 };
         
         // Update the best solution
-        self.best_esum = self.dp_energy_buffer[dinucleotides][best_config];
+        self.best_esum = dp_energy[dinucleotides][best_config];
+        self.best_bzenergy[..dinucleotides].copy_from_slice(&dp_bzenergy[dinucleotides][best_config]);
         
-        // Reconstruct the optimal path and build bzenergy/antisyn arrays
-        let mut current_config = best_config;
-        let mut current_pos = dinucleotides;
-        
-        // Clear and rebuild best_bzenergy and best_antisyn
-        self.best_bzenergy.fill(0.0);
-        self.best_antisyn.fill(' ');
-        
-        // Reconstruct path backwards
-        let mut path_configs = Vec::with_capacity(dinucleotides);
-        while current_pos > 0 {
-            path_configs.push(current_config);
-            current_config = best_prev[current_pos][current_config];
-            current_pos -= 1;
-        }
-        path_configs.reverse();
-        
-        // Build final arrays using the reconstructed path
-        for (din, &config) in path_configs.iter().enumerate() {
-            let bzindex_din = self.bzindex[din];
-            
-            let i = if din == 0 {
-                if config == 0 { 0 } else { 1 }
-            } else {
-                let prev_config = if din == 1 { 0 } else { path_configs[din - 1] };
-                match (prev_config, config) {
-                    (0, 0) => 0, // AS -> AS
-                    (1, 1) => 1, // SA -> SA
-                    (1, 0) => 3, // SA -> AS
-                    (0, 1) => 2, // AS -> SA
-                    _ => 0,
-                }
-            };
-            
-            self.best_bzenergy[din] = self.exp_dbzed[i][bzindex_din];
-            
-            // Set antisyn characters
-            let antisyn_idx = din * 2;
-            if antisyn_idx + 1 < self.best_antisyn.len() {
-                if config == 0 { // AS
-                    self.best_antisyn[antisyn_idx] = 'A';
-                    self.best_antisyn[antisyn_idx + 1] = 'S';
-                } else { // SA
-                    self.best_antisyn[antisyn_idx] = 'S';
-                    self.best_antisyn[antisyn_idx + 1] = 'A';
-                }
+        // Copy antisyn configuration
+        let best_antisyn_vec = &dp_antisyn[dinucleotides][best_config];
+        for (i, &ch) in best_antisyn_vec.iter().enumerate() {
+            if i < self.best_antisyn.len() {
+                self.best_antisyn[i] = ch;
             }
         }
         
         // Null terminate
-        let antisyn_len = dinucleotides * 2;
-        if antisyn_len < self.best_antisyn.len() {
-            self.best_antisyn[antisyn_len] = '\0';
+        if best_antisyn_vec.len() < self.best_antisyn.len() {
+            self.best_antisyn[best_antisyn_vec.len()] = '\0';
         }
     }
     
@@ -520,10 +503,7 @@ impl ZHunt {
         
         self.assign_bzenergy_index(nucleotides, &sequence[position..]);
         let mut best_dl = 50.0;
-        
-        // Use reusable buffer instead of allocating new vector
-        self.temp_antisyn.clear();
-        self.temp_antisyn.resize(nucleotides + 1, ' ');
+        let mut best_antisyn = vec![' '; nucleotides + 1];
 
         for din in from_din..=to_din {
             self.best_esum = init_esum;
@@ -534,11 +514,11 @@ impl ZHunt {
 
             if dl < best_dl {
                 best_dl = dl;
-                self.temp_antisyn.copy_from_slice(&self.best_antisyn);
+                best_antisyn.copy_from_slice(&self.best_antisyn);
             }
         }
 
-        let antisyn_str: String = self.temp_antisyn.iter().take_while(|&&c| c != '\0').collect();
+        let antisyn_str: String = best_antisyn.iter().take_while(|&&c| c != '\0').collect();
         let j = antisyn_str.len();
         let slope = self.delta_linking_slope(best_dl).atan() * PI_DEG;
         let probability = self.assign_probability(best_dl);
@@ -630,27 +610,16 @@ fn calculate_zscore_parallel(
     
     // Optimize chunk size for better cache locality and load balancing
     let num_threads = rayon::current_num_threads();
-    let chunk_size = (seq_length / (num_threads * 4)).max(500).min(2000);
-    
-    // Create a template ZHunt for cloning
-    let zhunt_template = Arc::new(zhunt.clone());
-    
-    // Pre-allocate result buffer to avoid repeated allocations
-    let mut chunk_results = Vec::with_capacity(chunk_size);
+    let chunk_size = (seq_length / (num_threads * 8)).max(1000).min(5000);
     
     for chunk_start in (0..seq_length).step_by(chunk_size) {
         let chunk_end = (chunk_start + chunk_size).min(seq_length);
         let sequence_ref = Arc::clone(&sequence);
-        let zhunt_ref = Arc::clone(&zhunt_template);
         
-        // Clear and reuse the same vector
-        chunk_results.clear();
-        
-        // Process chunk in parallel - use simpler approach
-        chunk_results.extend((chunk_start..chunk_end)
+        let mut chunk_results: Vec<PositionResult> = (chunk_start..chunk_end)
             .into_par_iter()
             .map(|i| {
-                let mut local_zhunt = zhunt_ref.as_ref().clone();
+                let mut local_zhunt = zhunt.clone();
                 local_zhunt.process_position(
                     i,
                     &sequence_ref,
@@ -661,23 +630,23 @@ fn calculate_zscore_parallel(
                     init_esum,
                 )
             })
-            .collect::<Vec<PositionResult>>());
+            .collect();
         
         // Sort chunk results by position
         chunk_results.sort_unstable_by_key(|r| r.position);
         
         // Write chunk results immediately to reduce memory usage
-        for result in &chunk_results {
-            write!(writer, "{} {} {} {:.3} {:.3} {:.3e} ",
+        for result in chunk_results {
+            write!(writer, "{} {} {} {:7.3} {:7.3} {} ",
                    result.position, result.end_position, result.length,
-                   result.best_dl, result.slope, result.probability)?;
+                   result.best_dl, result.slope, format_probability(result.probability))?;
             
             write!(writer, "{}   {}", result.sequence_segment, result.antisyn_str)?;
             writeln!(writer)?;
         }
         
         // Progress indicator - less frequent updates
-        if chunk_end % 10000 == 0 || chunk_end == seq_length {
+        if chunk_end % 20000 == 0 || chunk_end == seq_length {
             println!("Processed {}/{} positions", chunk_end, seq_length);
         }
     }
@@ -735,9 +704,9 @@ fn calculate_zscore_sequential(
             init_esum,
         );
         
-        write!(writer, "{} {} {} {:.3} {:.3} {:.3e} ",
+        write!(writer, "{} {} {} {:7.3} {:7.3} {} ",
                result.position, result.end_position, result.length,
-               result.best_dl, result.slope, result.probability)?;
+               result.best_dl, result.slope, format_probability(result.probability))?;
         
         write!(writer, "{}   {}", result.sequence_segment, result.antisyn_str)?;
         writeln!(writer)?;
